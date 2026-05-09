@@ -26,12 +26,16 @@ export OLLAMA_NUM_PARALLEL="${OLLAMA_NUM_PARALLEL:-1}"
 export OLLAMA_MAX_LOADED_MODELS="${OLLAMA_MAX_LOADED_MODELS:-1}"
 
 MODEL="${MODEL:-gemma4:e4b}"
-OLLAMA_INSTALL_PREFIX="${OLLAMA_INSTALL_PREFIX:-/usr}"
-OLLAMA_DOWNLOAD_MAX_TIME="${OLLAMA_DOWNLOAD_MAX_TIME:-900}"
+OLLAMA_FORCE_INSTALL="${OLLAMA_FORCE_INSTALL:-0}"
+OLLAMA_INSTALL_MAX_TIME="${OLLAMA_INSTALL_MAX_TIME:-1800}"
+OLLAMA_SMOKE_PORT="${OLLAMA_SMOKE_PORT:-11435}"
+OLLAMA_SMOKE_SECONDS="${OLLAMA_SMOKE_SECONDS:-30}"
 
 LOG_DIR="/workspace/logs"
 LOG_FILE="$LOG_DIR/ollama.log"
 PID_FILE="/workspace/ollama.pid"
+INSTALL_LOG="$LOG_DIR/ollama-install.log"
+SMOKE_LOG="$LOG_DIR/ollama-smoke.log"
 
 mkdir -p "$OLLAMA_MODELS"
 mkdir -p "$LOG_DIR"
@@ -79,38 +83,22 @@ install_apt_package() {
   run_as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y "$package"
 }
 
-install_ollama_bundle() {
-  local arch
-  local ver_param
-  local archive_url
+ollama_lib_dir() {
+  local bin_dir
+  local prefix
 
-  case "$(uname -m)" in
-    x86_64) arch="amd64" ;;
-    aarch64|arm64) arch="arm64" ;;
-    *)
-      log "ERROR: Unsupported architecture: $(uname -m)"
-      exit 1
-      ;;
-  esac
+  bin_dir="$(dirname "$(command -v ollama)")"
+  prefix="$(dirname "$bin_dir")"
+  echo "$prefix/lib/ollama"
+}
 
-  if ! command -v zstd >/dev/null 2>&1; then
-    log "Installing zstd for Ollama bundle extraction..."
-    install_apt_package zstd
-  fi
+install_ollama() {
+  local installer
 
-  ver_param=""
-  if [ -n "${OLLAMA_VERSION:-}" ]; then
-    ver_param="?version=$OLLAMA_VERSION"
-  fi
+  installer="$(mktemp /tmp/ollama-install.XXXXXX.sh)"
 
-  archive_url="https://ollama.com/download/ollama-linux-${arch}.tar.zst${ver_param}"
-
-  log "Installing Ollama runtime bundle..."
-  log "Download URL: $archive_url"
-  log "Install prefix: $OLLAMA_INSTALL_PREFIX"
-
-  run_as_root install -o0 -g0 -m755 -d "$OLLAMA_INSTALL_PREFIX/bin"
-  run_as_root install -o0 -g0 -m755 -d "$OLLAMA_INSTALL_PREFIX/lib/ollama"
+  log "Downloading official Ollama installer..."
+  log "Install log: $INSTALL_LOG"
 
   curl \
     --fail \
@@ -119,17 +107,99 @@ install_ollama_bundle() {
     --retry 5 \
     --retry-delay 2 \
     --connect-timeout 20 \
-    --max-time "$OLLAMA_DOWNLOAD_MAX_TIME" \
+    --max-time "$OLLAMA_INSTALL_MAX_TIME" \
     --progress-bar \
-    "$archive_url" |
-    zstd -d |
-    run_as_root tar -xf - -C "$OLLAMA_INSTALL_PREFIX"
+    -o "$installer" \
+    https://ollama.com/install.sh
+
+  log "Running official Ollama installer..."
+  sh "$installer" 2>&1 | tee "$INSTALL_LOG"
+}
+
+ollama_install_valid() {
+  local lib_dir
+  local smoke_pid
+  local started_smoke
+  local i
+  local broken_link
 
   if ! command -v ollama >/dev/null 2>&1; then
-    log "ERROR: Ollama installed, but 'ollama' is not on PATH."
-    log "Try: export PATH=\"$OLLAMA_INSTALL_PREFIX/bin:\$PATH\""
-    exit 1
+    log "Ollama validation failed: ollama command is missing"
+    return 1
   fi
+
+  if ! timeout 20s ollama --version >/dev/null 2>&1; then
+    log "Ollama validation failed: 'ollama --version' did not complete"
+    return 1
+  fi
+
+  lib_dir="$(ollama_lib_dir)"
+  if [ -d "$lib_dir" ]; then
+    broken_link="$(find "$lib_dir" -xtype l -print -quit 2>/dev/null || true)"
+    if [ -n "$broken_link" ]; then
+      log "Ollama validation failed: broken library symlink: $broken_link"
+      return 1
+    fi
+  fi
+
+  if ollama_healthy; then
+    log "Existing Ollama server is healthy; still running install smoke test"
+  fi
+
+  : > "$SMOKE_LOG"
+  started_smoke=0
+
+  log "Running Ollama smoke test on port $OLLAMA_SMOKE_PORT..."
+  OLLAMA_HOST="127.0.0.1:$OLLAMA_SMOKE_PORT" \
+    OLLAMA_MODELS="$OLLAMA_MODELS" \
+    ollama serve >> "$SMOKE_LOG" 2>&1 &
+  smoke_pid=$!
+  started_smoke=1
+
+  for i in $(seq 1 "$OLLAMA_SMOKE_SECONDS"); do
+    if curl -fsS "http://127.0.0.1:$OLLAMA_SMOKE_PORT/api/tags" >/dev/null 2>&1; then
+      break
+    fi
+
+    if ! ps -p "$smoke_pid" >/dev/null 2>&1; then
+      log "Ollama validation failed: smoke server exited early"
+      tail -100 "$SMOKE_LOG" || true
+      return 1
+    fi
+
+    sleep 1
+  done
+
+  if ! curl -fsS "http://127.0.0.1:$OLLAMA_SMOKE_PORT/api/tags" >/dev/null 2>&1; then
+    log "Ollama validation failed: smoke server did not become healthy"
+    tail -100 "$SMOKE_LOG" || true
+    if ps -p "$smoke_pid" >/dev/null 2>&1; then
+      kill "$smoke_pid" >/dev/null 2>&1 || true
+      wait "$smoke_pid" 2>/dev/null || true
+    fi
+    return 1
+  fi
+
+  if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+    if grep -q 'inference compute.*id=cpu' "$SMOKE_LOG" &&
+      ! grep -q 'inference compute.*library=cuda' "$SMOKE_LOG"; then
+      log "Ollama validation failed: NVIDIA GPU is visible, but Ollama detected CPU only"
+      tail -100 "$SMOKE_LOG" || true
+      if ps -p "$smoke_pid" >/dev/null 2>&1; then
+        kill "$smoke_pid" >/dev/null 2>&1 || true
+        wait "$smoke_pid" 2>/dev/null || true
+      fi
+      return 1
+    fi
+  fi
+
+  if [ "$started_smoke" -eq 1 ] && ps -p "$smoke_pid" >/dev/null 2>&1; then
+    kill "$smoke_pid" >/dev/null 2>&1 || true
+    wait "$smoke_pid" 2>/dev/null || true
+  fi
+
+  log "Ollama validation passed"
+  return 0
 }
 
 ########################################
@@ -144,16 +214,29 @@ fi
 
 if ! command -v nvidia-smi >/dev/null 2>&1; then
   log "WARNING: nvidia-smi not found"
+elif [ "${NVIDIA_VISIBLE_DEVICES:-}" = "void" ]; then
+  log "WARNING: NVIDIA_VISIBLE_DEVICES=void even though nvidia-smi is available; exporting NVIDIA_VISIBLE_DEVICES=all"
+  export NVIDIA_VISIBLE_DEVICES=all
 fi
 
 ########################################
-# Install Ollama if needed
+# Install/validate Ollama
 ########################################
 
-if ! command -v ollama >/dev/null 2>&1; then
-  install_ollama_bundle
+if [ "$OLLAMA_FORCE_INSTALL" = "1" ] || [ "$OLLAMA_FORCE_INSTALL" = "true" ]; then
+  log "OLLAMA_FORCE_INSTALL is set; reinstalling Ollama"
+  install_ollama
+elif ollama_install_valid; then
+  log "Ollama install looks healthy"
 else
-  log "Ollama already installed"
+  log "Existing Ollama install is missing or unhealthy; reinstalling"
+  install_ollama
+  if ! ollama_install_valid; then
+    log "ERROR: Ollama install still failed validation after reinstall"
+    log "Install log:"
+    tail -120 "$INSTALL_LOG" || true
+    exit 1
+  fi
 fi
 
 ########################################
