@@ -30,16 +30,22 @@ OLLAMA_FORCE_INSTALL="${OLLAMA_FORCE_INSTALL:-0}"
 OLLAMA_INSTALL_MAX_TIME="${OLLAMA_INSTALL_MAX_TIME:-1800}"
 OLLAMA_SMOKE_PORT="${OLLAMA_SMOKE_PORT:-11435}"
 OLLAMA_SMOKE_SECONDS="${OLLAMA_SMOKE_SECONDS:-30}"
-OLLAMA_RELEASE_ASSETS_IP="${OLLAMA_RELEASE_ASSETS_IP:-auto}"
-OLLAMA_RELEASE_ASSETS_PROBE_BYTES="${OLLAMA_RELEASE_ASSETS_PROBE_BYTES:-1048576}"
-OLLAMA_RELEASE_ASSETS_PROBE_SECONDS="${OLLAMA_RELEASE_ASSETS_PROBE_SECONDS:-8}"
+
+# Fail fast on bad pods before paying to install/pull/load models.
+RUNPOD_PREFLIGHT_CHECKS="${RUNPOD_PREFLIGHT_CHECKS:-1}"
+RUNPOD_NETWORK_TEST_BYTES="${RUNPOD_NETWORK_TEST_BYTES:-104857600}"
+RUNPOD_NETWORK_TEST_MAX_TIME="${RUNPOD_NETWORK_TEST_MAX_TIME:-30}"
+RUNPOD_NETWORK_MIN_BPS="${RUNPOD_NETWORK_MIN_BPS:-5000000}"
+RUNPOD_WORKSPACE_TEST_BYTES="${RUNPOD_WORKSPACE_TEST_BYTES:-536870912}"
+RUNPOD_WORKSPACE_MIN_WRITE_BPS="${RUNPOD_WORKSPACE_MIN_WRITE_BPS:-200000000}"
+RUNPOD_WORKSPACE_MIN_READ_BPS="${RUNPOD_WORKSPACE_MIN_READ_BPS:-200000000}"
+RUNPOD_NETWORK_TEST_URL="${RUNPOD_NETWORK_TEST_URL:-}"
 
 LOG_DIR="/workspace/logs"
 LOG_FILE="$LOG_DIR/ollama.log"
 PID_FILE="/workspace/ollama.pid"
 INSTALL_LOG="$LOG_DIR/ollama-install.log"
 SMOKE_LOG="$LOG_DIR/ollama-smoke.log"
-HOSTS_PIN_MARKER="# hallmark_runpod_tools ollama release-assets pin"
 
 mkdir -p "$OLLAMA_MODELS"
 mkdir -p "$LOG_DIR"
@@ -87,117 +93,23 @@ install_apt_package() {
   run_as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y "$package"
 }
 
-remove_release_assets_pin() {
-  local tmp
-
-  if ! grep -qF "$HOSTS_PIN_MARKER" /etc/hosts 2>/dev/null; then
-    return 0
-  fi
-
-  tmp="$(mktemp /tmp/hosts.XXXXXX)"
-  grep -vF "$HOSTS_PIN_MARKER" /etc/hosts > "$tmp" || true
-  run_as_root cp "$tmp" /etc/hosts
-  rm -f "$tmp"
-}
-
-pin_release_assets_ip() {
-  local ip="$1"
-
-  remove_release_assets_pin
-  log "Temporarily pinning release-assets.githubusercontent.com to $ip"
-  printf '%s release-assets.githubusercontent.com %s\n' "$ip" "$HOSTS_PIN_MARKER" |
-    run_as_root tee -a /etc/hosts >/dev/null
-}
-
-release_assets_ips() {
-  local ips
-
-  ips="$(getent ahostsv4 release-assets.githubusercontent.com 2>/dev/null |
-    awk '{print $1}' |
-    sort -u || true)"
-
-  if [ -n "$ips" ]; then
-    echo "$ips"
-  else
-    printf '%s\n' \
-      185.199.108.133 \
-      185.199.109.133 \
-      185.199.110.133 \
-      185.199.111.133
-  fi
-}
-
-select_release_assets_ip() {
-  local url
-  local ip
-  local tmp
-  local speed
-  local best_ip
-  local best_speed
-
-  url="$(curl -sSIL --max-time 20 -o /dev/null -w '%{url_effective}' \
-    https://ollama.com/download/ollama-linux-amd64.tar.zst || true)"
-  if [ -z "$url" ]; then
-    return 1
-  fi
-
-  best_ip=""
-  best_speed=0
-
-  for ip in $(release_assets_ips); do
-    tmp="$(mktemp /tmp/ollama-release-assets.XXXXXX)"
-    speed="$(
-      curl \
-        --resolve "release-assets.githubusercontent.com:443:$ip" \
-        --range "0-$((OLLAMA_RELEASE_ASSETS_PROBE_BYTES - 1))" \
-        --fail \
-        --silent \
-        --show-error \
-        --location \
-        --connect-timeout 10 \
-        --max-time "$OLLAMA_RELEASE_ASSETS_PROBE_SECONDS" \
-        -o "$tmp" \
-        -w '%{speed_download}' \
-        "$url" 2>/dev/null || true
-    )"
-    rm -f "$tmp"
-
-    speed="${speed%.*}"
-    if [ -n "$speed" ] && [ "$speed" -gt "$best_speed" ] 2>/dev/null; then
-      best_ip="$ip"
-      best_speed="$speed"
-    fi
-  done
-
-  if [ -n "$best_ip" ]; then
-    echo "$best_ip"
-    return 0
-  fi
-
-  return 1
-}
-
-configure_release_assets_route() {
-  local ip
-
-  case "$OLLAMA_RELEASE_ASSETS_IP" in
-    ""|0|false|off|none)
-      log "GitHub release-assets IP pinning disabled"
-      return 0
-      ;;
-    auto)
-      log "Probing GitHub release-assets IPs before Ollama install..."
-      if ip="$(select_release_assets_ip)"; then
-        log "Fastest release-assets.githubusercontent.com probe: $ip"
-        pin_release_assets_ip "$ip"
-      else
-        log "WARNING: Could not select a release-assets IP; continuing without pinning"
-      fi
-      ;;
+ollama_arch() {
+  case "$(uname -m)" in
+    x86_64) echo "amd64" ;;
+    aarch64|arm64) echo "arm64" ;;
     *)
-      pin_release_assets_ip "$OLLAMA_RELEASE_ASSETS_IP"
+      log "ERROR: Unsupported architecture: $(uname -m)"
+      exit 1
       ;;
   esac
+}
+
+ollama_bundle_url() {
+  local arch
+
+  arch="$(ollama_arch)"
+  curl -sSIL --max-time 20 -o /dev/null -w '%{url_effective}' \
+    "https://ollama.com/download/ollama-linux-${arch}.tar.zst"
 }
 
 ollama_lib_dir() {
@@ -207,6 +119,149 @@ ollama_lib_dir() {
   bin_dir="$(dirname "$(command -v ollama)")"
   prefix="$(dirname "$bin_dir")"
   echo "$prefix/lib/ollama"
+}
+
+format_bps() {
+  awk -v bps="$1" 'BEGIN {
+    if (bps >= 1000000000) printf "%.1f GB/s", bps / 1000000000;
+    else if (bps >= 1000000) printf "%.1f MB/s", bps / 1000000;
+    else if (bps >= 1000) printf "%.1f KB/s", bps / 1000;
+    else printf "%d B/s", bps;
+  }'
+}
+
+elapsed_bps() {
+  local bytes="$1"
+  local start_ns="$2"
+  local end_ns="$3"
+
+  awk -v bytes="$bytes" -v start="$start_ns" -v end="$end_ns" 'BEGIN {
+    elapsed = (end - start) / 1000000000;
+    if (elapsed <= 0) elapsed = 0.001;
+    printf "%d", bytes / elapsed;
+  }'
+}
+
+fail_pod_preflight() {
+  local reason="$1"
+
+  log "ERROR: Pod preflight failed: $reason"
+  cat <<EOF
+
+This pod looks unhealthy for this workflow.
+
+Recommendation:
+  Stop this pod and create a new RunPod pod, preferably in a different host or
+  region. The startup script is stopping before doing expensive install/model
+  work so you do not keep paying for a bad pod.
+
+To bypass these checks anyway:
+  RUNPOD_PREFLIGHT_CHECKS=0 ./pod_startup.sh
+
+EOF
+  exit 42
+}
+
+run_network_preflight() {
+  local url
+  local tmp
+  local speed
+  local size
+  local code
+
+  url="$RUNPOD_NETWORK_TEST_URL"
+  if [ -z "$url" ]; then
+    url="$(ollama_bundle_url || true)"
+  fi
+
+  if [ -z "$url" ]; then
+    fail_pod_preflight "could not resolve Ollama bundle URL for network test"
+  fi
+
+  tmp="$(mktemp /tmp/runpod-network-test.XXXXXX)"
+  log "Testing network bandwidth against Ollama bundle path..."
+  log "Network test bytes: $RUNPOD_NETWORK_TEST_BYTES"
+
+  speed="$(
+    curl \
+      --fail \
+      --silent \
+      --show-error \
+      --location \
+      --range "0-$((RUNPOD_NETWORK_TEST_BYTES - 1))" \
+      --connect-timeout 10 \
+      --max-time "$RUNPOD_NETWORK_TEST_MAX_TIME" \
+      -o "$tmp" \
+      -w '%{http_code} %{size_download} %{speed_download}' \
+      "$url" 2>/tmp/runpod-network-test.err || true
+  )"
+
+  code="$(printf '%s' "$speed" | awk '{print $1}')"
+  size="$(printf '%s' "$speed" | awk '{print int($2)}')"
+  speed="$(printf '%s' "$speed" | awk '{print int($3)}')"
+  rm -f "$tmp"
+
+  if [ "${code:-0}" -lt 200 ] || [ "${code:-0}" -ge 400 ] || [ "${size:-0}" -eq 0 ]; then
+    cat /tmp/runpod-network-test.err || true
+    fail_pod_preflight "network test failed before downloading data"
+  fi
+
+  log "Network bandwidth: $(format_bps "$speed")"
+  if [ "$speed" -lt "$RUNPOD_NETWORK_MIN_BPS" ]; then
+    fail_pod_preflight "network bandwidth $(format_bps "$speed") is below threshold $(format_bps "$RUNPOD_NETWORK_MIN_BPS")"
+  fi
+}
+
+run_workspace_preflight() {
+  local test_file
+  local test_mb
+  local test_bytes
+  local start_ns
+  local end_ns
+  local write_bps
+  local read_bps
+
+  test_file="$LOG_DIR/workspace-bandwidth-test.bin"
+  test_mb="$(( (RUNPOD_WORKSPACE_TEST_BYTES + 1048575) / 1048576 ))"
+  if [ "$test_mb" -lt 1 ]; then
+    test_mb=1
+  fi
+  test_bytes="$((test_mb * 1048576))"
+
+  log "Testing /workspace write/read bandwidth..."
+  log "Workspace test bytes: $test_bytes"
+
+  start_ns="$(date +%s%N)"
+  dd if=/dev/zero of="$test_file" bs=1M count="$test_mb" conv=fdatasync status=none
+  end_ns="$(date +%s%N)"
+  write_bps="$(elapsed_bps "$test_bytes" "$start_ns" "$end_ns")"
+  log "/workspace write bandwidth: $(format_bps "$write_bps")"
+
+  start_ns="$(date +%s%N)"
+  dd if="$test_file" of=/dev/null bs=1M status=none
+  end_ns="$(date +%s%N)"
+  read_bps="$(elapsed_bps "$test_bytes" "$start_ns" "$end_ns")"
+  log "/workspace read bandwidth: $(format_bps "$read_bps")"
+
+  rm -f "$test_file"
+
+  if [ "$write_bps" -lt "$RUNPOD_WORKSPACE_MIN_WRITE_BPS" ]; then
+    fail_pod_preflight "/workspace write bandwidth $(format_bps "$write_bps") is below threshold $(format_bps "$RUNPOD_WORKSPACE_MIN_WRITE_BPS")"
+  fi
+
+  if [ "$read_bps" -lt "$RUNPOD_WORKSPACE_MIN_READ_BPS" ]; then
+    fail_pod_preflight "/workspace read bandwidth $(format_bps "$read_bps") is below threshold $(format_bps "$RUNPOD_WORKSPACE_MIN_READ_BPS")"
+  fi
+}
+
+run_pod_preflight() {
+  if [ "$RUNPOD_PREFLIGHT_CHECKS" = "0" ] || [ "$RUNPOD_PREFLIGHT_CHECKS" = "false" ]; then
+    log "Pod preflight checks disabled"
+    return 0
+  fi
+
+  run_network_preflight
+  run_workspace_preflight
 }
 
 install_ollama() {
@@ -230,11 +285,7 @@ install_ollama() {
     https://ollama.com/install.sh
 
   log "Running official Ollama installer..."
-  configure_release_assets_route
-  trap remove_release_assets_pin EXIT
   sh "$installer" 2>&1 | tee "$INSTALL_LOG"
-  remove_release_assets_pin
-  trap - EXIT
 }
 
 ollama_install_valid() {
@@ -332,6 +383,8 @@ log "Checking dependencies..."
 if ! command -v curl >/dev/null 2>&1; then
   install_apt_package curl
 fi
+
+run_pod_preflight
 
 if ! command -v nvidia-smi >/dev/null 2>&1; then
   log "WARNING: nvidia-smi not found"
