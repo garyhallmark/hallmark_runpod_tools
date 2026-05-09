@@ -384,6 +384,10 @@ if ! command -v curl >/dev/null 2>&1; then
   install_apt_package curl
 fi
 
+if ! command -v zstd >/dev/null 2>&1; then
+  install_apt_package zstd
+fi
+
 run_pod_preflight
 
 if ! command -v nvidia-smi >/dev/null 2>&1; then

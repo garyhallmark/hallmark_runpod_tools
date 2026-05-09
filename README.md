@@ -19,13 +19,14 @@ model if needed, and prints useful diagnostics.
    RunPod mounts this at `/workspace`.
 3. Use a CUDA/PyTorch-style image or template that can run `nvidia-smi`.
 4. Expose HTTP port `11434`.
-5. Add environment variables in the pod template if you want custom defaults:
+5. Set the minimum environment variable needed for external access:
 
 ```bash
 OLLAMA_HOST=0.0.0.0:11434
-OLLAMA_MODELS=/workspace/ollama-models
-MODEL=gemma4:e4b
 ```
+
+Everything else has script defaults. In particular, `pod_startup.sh` defaults
+the model cache to `/workspace/ollama-models` and the model to `gemma4:e4b`.
 
 RunPod's public proxy URL for Ollama will usually look like:
 
