@@ -30,12 +30,16 @@ OLLAMA_FORCE_INSTALL="${OLLAMA_FORCE_INSTALL:-0}"
 OLLAMA_INSTALL_MAX_TIME="${OLLAMA_INSTALL_MAX_TIME:-1800}"
 OLLAMA_SMOKE_PORT="${OLLAMA_SMOKE_PORT:-11435}"
 OLLAMA_SMOKE_SECONDS="${OLLAMA_SMOKE_SECONDS:-30}"
+OLLAMA_RELEASE_ASSETS_IP="${OLLAMA_RELEASE_ASSETS_IP:-auto}"
+OLLAMA_RELEASE_ASSETS_PROBE_BYTES="${OLLAMA_RELEASE_ASSETS_PROBE_BYTES:-1048576}"
+OLLAMA_RELEASE_ASSETS_PROBE_SECONDS="${OLLAMA_RELEASE_ASSETS_PROBE_SECONDS:-8}"
 
 LOG_DIR="/workspace/logs"
 LOG_FILE="$LOG_DIR/ollama.log"
 PID_FILE="/workspace/ollama.pid"
 INSTALL_LOG="$LOG_DIR/ollama-install.log"
 SMOKE_LOG="$LOG_DIR/ollama-smoke.log"
+HOSTS_PIN_MARKER="# hallmark_runpod_tools ollama release-assets pin"
 
 mkdir -p "$OLLAMA_MODELS"
 mkdir -p "$LOG_DIR"
@@ -83,6 +87,119 @@ install_apt_package() {
   run_as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y "$package"
 }
 
+remove_release_assets_pin() {
+  local tmp
+
+  if ! grep -qF "$HOSTS_PIN_MARKER" /etc/hosts 2>/dev/null; then
+    return 0
+  fi
+
+  tmp="$(mktemp /tmp/hosts.XXXXXX)"
+  grep -vF "$HOSTS_PIN_MARKER" /etc/hosts > "$tmp" || true
+  run_as_root cp "$tmp" /etc/hosts
+  rm -f "$tmp"
+}
+
+pin_release_assets_ip() {
+  local ip="$1"
+
+  remove_release_assets_pin
+  log "Temporarily pinning release-assets.githubusercontent.com to $ip"
+  printf '%s release-assets.githubusercontent.com %s\n' "$ip" "$HOSTS_PIN_MARKER" |
+    run_as_root tee -a /etc/hosts >/dev/null
+}
+
+release_assets_ips() {
+  local ips
+
+  ips="$(getent ahostsv4 release-assets.githubusercontent.com 2>/dev/null |
+    awk '{print $1}' |
+    sort -u || true)"
+
+  if [ -n "$ips" ]; then
+    echo "$ips"
+  else
+    printf '%s\n' \
+      185.199.108.133 \
+      185.199.109.133 \
+      185.199.110.133 \
+      185.199.111.133
+  fi
+}
+
+select_release_assets_ip() {
+  local url
+  local ip
+  local tmp
+  local speed
+  local best_ip
+  local best_speed
+
+  url="$(curl -sSIL --max-time 20 -o /dev/null -w '%{url_effective}' \
+    https://ollama.com/download/ollama-linux-amd64.tar.zst || true)"
+  if [ -z "$url" ]; then
+    return 1
+  fi
+
+  best_ip=""
+  best_speed=0
+
+  for ip in $(release_assets_ips); do
+    tmp="$(mktemp /tmp/ollama-release-assets.XXXXXX)"
+    speed="$(
+      curl \
+        --resolve "release-assets.githubusercontent.com:443:$ip" \
+        --range "0-$((OLLAMA_RELEASE_ASSETS_PROBE_BYTES - 1))" \
+        --fail \
+        --silent \
+        --show-error \
+        --location \
+        --connect-timeout 10 \
+        --max-time "$OLLAMA_RELEASE_ASSETS_PROBE_SECONDS" \
+        -o "$tmp" \
+        -w '%{speed_download}' \
+        "$url" 2>/dev/null || true
+    )"
+    rm -f "$tmp"
+
+    speed="${speed%.*}"
+    if [ -n "$speed" ] && [ "$speed" -gt "$best_speed" ] 2>/dev/null; then
+      best_ip="$ip"
+      best_speed="$speed"
+    fi
+  done
+
+  if [ -n "$best_ip" ]; then
+    echo "$best_ip"
+    return 0
+  fi
+
+  return 1
+}
+
+configure_release_assets_route() {
+  local ip
+
+  case "$OLLAMA_RELEASE_ASSETS_IP" in
+    ""|0|false|off|none)
+      log "GitHub release-assets IP pinning disabled"
+      return 0
+      ;;
+    auto)
+      log "Probing GitHub release-assets IPs before Ollama install..."
+      if ip="$(select_release_assets_ip)"; then
+        log "Fastest release-assets.githubusercontent.com probe: $ip"
+        pin_release_assets_ip "$ip"
+      else
+        log "WARNING: Could not select a release-assets IP; continuing without pinning"
+      fi
+      ;;
+    *)
+      pin_release_assets_ip "$OLLAMA_RELEASE_ASSETS_IP"
+      ;;
+  esac
+}
+
 ollama_lib_dir() {
   local bin_dir
   local prefix
@@ -113,7 +230,11 @@ install_ollama() {
     https://ollama.com/install.sh
 
   log "Running official Ollama installer..."
+  configure_release_assets_route
+  trap remove_release_assets_pin EXIT
   sh "$installer" 2>&1 | tee "$INSTALL_LOG"
+  remove_release_assets_pin
+  trap - EXIT
 }
 
 ollama_install_valid() {

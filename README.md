@@ -115,6 +115,19 @@ If you change the port, expose the same port in RunPod.
 `OLLAMA_SMOKE_SECONDS`
 : Seconds to wait for the validation server to become healthy. Default: `30`.
 
+`OLLAMA_RELEASE_ASSETS_IP`
+: GitHub release-assets routing for the official Ollama installer. Default:
+`auto`, which probes available IPs and temporarily pins the fastest one in
+`/etc/hosts` during install. Set to `0` to disable, or set a specific IP such as
+`185.199.109.133`.
+
+`OLLAMA_RELEASE_ASSETS_PROBE_BYTES`
+: Bytes to download from each GitHub release-assets IP during the installer
+route probe. Default: `1048576`.
+
+`OLLAMA_RELEASE_ASSETS_PROBE_SECONDS`
+: Max seconds per GitHub release-assets IP probe. Default: `8`.
+
 ## Verify Ollama
 
 Check the API:
@@ -244,15 +257,33 @@ Look at:
 tail -f /workspace/logs/ollama-install.log
 ```
 
-Also compare network speed from other sources:
+The official installer downloads the Linux bundle through GitHub releases. On
+some pods, DNS can choose a slow `release-assets.githubusercontent.com` edge. The
+startup script probes the candidate GitHub release-assets IPs and temporarily
+pins the fastest one during install.
+
+If you find a known-good edge, force it:
+
+```bash
+OLLAMA_RELEASE_ASSETS_IP=185.199.109.133 OLLAMA_FORCE_INSTALL=1 ./pod_startup.sh
+```
+
+Disable pinning:
+
+```bash
+OLLAMA_RELEASE_ASSETS_IP=0 OLLAMA_FORCE_INSTALL=1 ./pod_startup.sh
+```
+
+Compare network speed from other sources:
 
 ```bash
 apt-get update
+curl -L -o /tmp/cloudflare-10mb.bin 'https://speed.cloudflare.com/__down?bytes=10000000'
 ```
 
 If apt is fast but Ollama download is slow, the issue is likely connectivity to
-Ollama's download host from that pod or region. Try a different RunPod region,
-GPU host, or rerun with:
+GitHub release-assets from that pod or region. Try the auto pinning behavior,
+a specific known-fast IP, a different RunPod region, or a different GPU host.
 
 ```bash
 OLLAMA_FORCE_INSTALL=1 ./pod_startup.sh
