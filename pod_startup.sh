@@ -26,6 +26,8 @@ export OLLAMA_NUM_PARALLEL="${OLLAMA_NUM_PARALLEL:-1}"
 export OLLAMA_MAX_LOADED_MODELS="${OLLAMA_MAX_LOADED_MODELS:-1}"
 
 MODEL="${MODEL:-gemma4:e4b}"
+OLLAMA_INSTALL_PREFIX="${OLLAMA_INSTALL_PREFIX:-/usr}"
+OLLAMA_DOWNLOAD_MAX_TIME="${OLLAMA_DOWNLOAD_MAX_TIME:-900}"
 
 LOG_DIR="/workspace/logs"
 LOG_FILE="$LOG_DIR/ollama.log"
@@ -57,6 +59,79 @@ wait_for_ollama() {
   return 1
 }
 
+run_as_root() {
+  if [ "$(id -u)" -eq 0 ]; then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+install_apt_package() {
+  local package="$1"
+
+  if ! command -v apt-get >/dev/null 2>&1; then
+    log "ERROR: apt-get not found. Please install $package in the pod image."
+    exit 1
+  fi
+
+  run_as_root apt-get update
+  run_as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y "$package"
+}
+
+install_ollama_bundle() {
+  local arch
+  local ver_param
+  local archive_url
+
+  case "$(uname -m)" in
+    x86_64) arch="amd64" ;;
+    aarch64|arm64) arch="arm64" ;;
+    *)
+      log "ERROR: Unsupported architecture: $(uname -m)"
+      exit 1
+      ;;
+  esac
+
+  if ! command -v zstd >/dev/null 2>&1; then
+    log "Installing zstd for Ollama bundle extraction..."
+    install_apt_package zstd
+  fi
+
+  ver_param=""
+  if [ -n "${OLLAMA_VERSION:-}" ]; then
+    ver_param="?version=$OLLAMA_VERSION"
+  fi
+
+  archive_url="https://ollama.com/download/ollama-linux-${arch}.tar.zst${ver_param}"
+
+  log "Installing Ollama runtime bundle..."
+  log "Download URL: $archive_url"
+  log "Install prefix: $OLLAMA_INSTALL_PREFIX"
+
+  run_as_root install -o0 -g0 -m755 -d "$OLLAMA_INSTALL_PREFIX/bin"
+  run_as_root install -o0 -g0 -m755 -d "$OLLAMA_INSTALL_PREFIX/lib/ollama"
+
+  curl \
+    --fail \
+    --show-error \
+    --location \
+    --retry 5 \
+    --retry-delay 2 \
+    --connect-timeout 20 \
+    --max-time "$OLLAMA_DOWNLOAD_MAX_TIME" \
+    --progress-bar \
+    "$archive_url" |
+    zstd -d |
+    run_as_root tar -xf - -C "$OLLAMA_INSTALL_PREFIX"
+
+  if ! command -v ollama >/dev/null 2>&1; then
+    log "ERROR: Ollama installed, but 'ollama' is not on PATH."
+    log "Try: export PATH=\"$OLLAMA_INSTALL_PREFIX/bin:\$PATH\""
+    exit 1
+  fi
+}
+
 ########################################
 # Basic tools
 ########################################
@@ -64,8 +139,7 @@ wait_for_ollama() {
 log "Checking dependencies..."
 
 if ! command -v curl >/dev/null 2>&1; then
-  apt-get update
-  apt-get install -y curl
+  install_apt_package curl
 fi
 
 if ! command -v nvidia-smi >/dev/null 2>&1; then
@@ -77,8 +151,7 @@ fi
 ########################################
 
 if ! command -v ollama >/dev/null 2>&1; then
-  log "Installing Ollama..."
-  curl -fsSL https://ollama.com/install.sh | sh
+  install_ollama_bundle
 else
   log "Ollama already installed"
 fi
