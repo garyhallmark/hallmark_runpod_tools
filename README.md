@@ -15,18 +15,15 @@ model if needed, and prints useful diagnostics.
 ## Create A RunPod Pod
 
 1. Create a new RunPod pod with a CUDA-capable GPU.
-2. Attach a network volume if you want model downloads to survive pod changes.
+2. Attach a volume at least `40 GB`.
    RunPod mounts this at `/workspace`.
 3. Use a CUDA/PyTorch-style image or template that can run `nvidia-smi`.
 4. Expose HTTP port `11434`.
-5. Set the minimum environment variable needed for external access:
-
-```bash
-OLLAMA_HOST=0.0.0.0:11434
-```
 
 Everything else has script defaults. In particular, `pod_startup.sh` defaults
-the model cache to `/workspace/ollama-models` and the model to `gemma4:e4b`.
+- model cache: `/workspace/ollama-models`,
+- model: `gemma4:e4b`,
+- ollama host: `0.0.0.0:11434`
 
 RunPod's public proxy URL for Ollama will usually look like:
 
@@ -51,14 +48,6 @@ RunPod shows the exact SSH command in the pod connection panel.
 ## Clone This Repo
 
 From the pod:
-
-```bash
-cd /workspace
-git clone git@github.com:garyhallmark/hallmark_runpod_tools.git
-cd hallmark_runpod_tools
-```
-
-If the pod does not have your GitHub SSH key, use HTTPS instead:
 
 ```bash
 git clone https://github.com/garyhallmark/hallmark_runpod_tools.git
@@ -131,13 +120,16 @@ Default: `104857600`.
 : Bytes to write/read under `/workspace/logs` during the storage check.
 Default: `536870912`.
 
+`RUNPOD_WORKSPACE_MIN_FREE_BYTES`
+: Minimum required free space under `/workspace`. Default: `30000000000`.
+
 `RUNPOD_WORKSPACE_MIN_WRITE_BPS`
 : Minimum acceptable `/workspace` write throughput in bytes per second.
-Default: `200000000`.
+Default: `100000000`.
 
 `RUNPOD_WORKSPACE_MIN_READ_BPS`
 : Minimum acceptable `/workspace` read throughput in bytes per second.
-Default: `200000000`.
+Default: `100000000`.
 
 ## Verify Ollama
 

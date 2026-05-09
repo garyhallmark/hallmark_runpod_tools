@@ -37,8 +37,9 @@ RUNPOD_NETWORK_TEST_BYTES="${RUNPOD_NETWORK_TEST_BYTES:-104857600}"
 RUNPOD_NETWORK_TEST_MAX_TIME="${RUNPOD_NETWORK_TEST_MAX_TIME:-30}"
 RUNPOD_NETWORK_MIN_BPS="${RUNPOD_NETWORK_MIN_BPS:-5000000}"
 RUNPOD_WORKSPACE_TEST_BYTES="${RUNPOD_WORKSPACE_TEST_BYTES:-536870912}"
-RUNPOD_WORKSPACE_MIN_WRITE_BPS="${RUNPOD_WORKSPACE_MIN_WRITE_BPS:-200000000}"
-RUNPOD_WORKSPACE_MIN_READ_BPS="${RUNPOD_WORKSPACE_MIN_READ_BPS:-200000000}"
+RUNPOD_WORKSPACE_MIN_FREE_BYTES="${RUNPOD_WORKSPACE_MIN_FREE_BYTES:-30000000000}"
+RUNPOD_WORKSPACE_MIN_WRITE_BPS="${RUNPOD_WORKSPACE_MIN_WRITE_BPS:-100000000}"
+RUNPOD_WORKSPACE_MIN_READ_BPS="${RUNPOD_WORKSPACE_MIN_READ_BPS:-100000000}"
 RUNPOD_NETWORK_TEST_URL="${RUNPOD_NETWORK_TEST_URL:-}"
 
 LOG_DIR="/workspace/logs"
@@ -216,10 +217,17 @@ run_workspace_preflight() {
   local test_file
   local test_mb
   local test_bytes
+  local available_bytes
   local start_ns
   local end_ns
   local write_bps
   local read_bps
+
+  available_bytes="$(df -PB1 /workspace | awk 'NR == 2 {print $4}')"
+  log "/workspace available space: $available_bytes bytes"
+  if [ "${available_bytes:-0}" -lt "$RUNPOD_WORKSPACE_MIN_FREE_BYTES" ]; then
+    fail_pod_preflight "/workspace free space $available_bytes bytes is below threshold $RUNPOD_WORKSPACE_MIN_FREE_BYTES bytes"
+  fi
 
   test_file="$LOG_DIR/workspace-bandwidth-test.bin"
   test_mb="$(( (RUNPOD_WORKSPACE_TEST_BYTES + 1048575) / 1048576 ))"
